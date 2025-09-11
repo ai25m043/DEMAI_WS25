@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  # --- Zookeeper ---
+  zookeeper:
+    image: bitnami/zookeeper:latest
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+
+  # --- Kafka ---
+  kafka:
+    image: bitnami/kafka:3.4
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_BROKER_ID=1
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    depends_on:
+      - zookeeper
+
+  # --- MongoDB ---
+  mongo:
+    image: mongo:6
+    container_name: mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  # --- Spark Master ---
+  spark-master:
+    image: bitnami/spark:latest
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+
+  # --- Spark Worker ---
+  spark-worker:
+    image: bitnami/spark:latest
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    ports:
+      - "8081:8081"
+
+  # --- Event Simulator ---
+  event-simulator:
+    build: ./event-simulator
+    container_name: event-simulator
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=wikipedia.changes
+
+  # --- Stream Processor ---
+  stream-processor:
+    build: ./stream-processor
+    container_name: stream-processor
+    depends_on:
+      - kafka
+      - mongo
+      - spark-master
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=wikipedia.changes
+      - MONGO_URI=mongodb://mongo:27017/
+      - MONGO_DB=wikipedia
+      - MONGO_COLLECTION=page_scores
+
+volumes:
+  mongo-data:
+
+networks:
+  default:
+    name: sparknet
