@@ -38,10 +38,10 @@ SET label = EXCLUDED.label,
 -- =========================
 CREATE TABLE IF NOT EXISTS wm_recent_change (
   meta_id   TEXT PRIMARY KEY,
-  dt        TIMESTAMPTZ NOT NULL,
-  wiki      TEXT NOT NULL,
+  dt        TIMESTAMPTZ,
+  wiki      TEXT,
   page_id   BIGINT,
-  title     TEXT NOT NULL,
+  title     TEXT,
   namespace INT,
   type      TEXT,
   user_text TEXT,
