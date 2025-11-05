@@ -1,5 +1,5 @@
 -- ============================================
--- init.sql (with global tickers)
+-- init.sql (with global tickers - fixed)
 -- ============================================
 
 -- =========================
@@ -132,12 +132,17 @@ WHERE (ti.id, sv.ts_utc) IN (
 );
 
 -- =========================
--- 5) Seed global tickers
+-- 5) Seed global tickers (FIXED)
 -- =========================
 
-WITH eq AS (SELECT id FROM wm_topic WHERE key = 'equity')
+WITH eq AS (
+  SELECT id AS topic_id
+  FROM wm_topic
+  WHERE key = 'equity'
+)
 INSERT INTO ticker(symbol, name, exchange, currency, topic_id)
-SELECT s.symbol, s.name, s.exchange, s.currency, eq.id
+SELECT
+  s.symbol, s.name, s.exchange, s.currency, eq.topic_id
 FROM (VALUES
   -- United States
   ('AAPL','Apple Inc.','NASDAQ','USD'),
@@ -201,6 +206,7 @@ FROM (VALUES
   -- Singapore
   ('D05.SI','DBS Group Holdings Ltd.','SGX','SGD')
 ) AS s(symbol, name, exchange, currency)
+CROSS JOIN eq
 ON CONFLICT (symbol) DO UPDATE
 SET name = EXCLUDED.name,
     exchange = EXCLUDED.exchange,
