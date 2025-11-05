@@ -1,91 +1,166 @@
-version: '3.8'
+version: "3.9"
 
 services:
-  # --- Zookeeper ---
-  zookeeper:
-    image: bitnami/zookeeper:latest
-    container_name: zookeeper
-    ports:
-      - "2181:2181"
+  postgres:
+    image: postgres:16
+    container_name: wm-postgres
+    restart: unless-stopped
     environment:
-      - ALLOW_ANONYMOUS_LOGIN=yes
+      POSTGRES_DB: demai
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demai"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
-  # --- Kafka ---
   kafka:
-    image: bitnami/kafka:3.4
-    container_name: kafka
+    image: apache/kafka:4.1.0
+    container_name: wm-kafka
+    restart: unless-stopped
     ports:
       - "9092:9092"
     environment:
-      - KAFKA_BROKER_ID=1
-      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
-      - ALLOW_PLAINTEXT_LISTENER=yes
-    depends_on:
-      - zookeeper
-
-  # --- MongoDB ---
-  mongo:
-    image: mongo:6
-    container_name: mongo
-    restart: always
-    ports:
-      - "27017:27017"
+      # Single-broker KRaft mode
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@wm-kafka:9093"
+      KAFKA_CLUSTER_ID: "UOP0ms5eQwq4Q3ShB8XkHg"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://wm-kafka:9092"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
     volumes:
-      - mongo-data:/data/db
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
-  # --- Spark Master ---
-  spark-master:
-    image: bitnami/spark:latest
-    container_name: spark-master
+  kafka-init:
+    image: apache/kafka:4.1.0
+    container_name: wm-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      [
+        "bash","-lc",
+        "/opt/kafka/bin/kafka-topics.sh --bootstrap-server wm-kafka:9092 --create --if-not-exists --topic wm-recentchange --replication-factor 1 --partitions 1"
+      ]
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: wm-kafka-ui
+    ports: ["8081:8080"]
     environment:
-      - SPARK_MODE=master
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: wm-kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  bridge:
+    build:
+      context: ./bridge
+    container_name: wm-bridge
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: "wm-kafka:9092"
+      KAFKA_TOPIC: "wm-recentchange"
+      WIKI_USER_AGENT: "WM-Live-Bridge/0.1 (contact: you@example.com)"
+    restart: unless-stopped
+
+  spark-job:
+    image: apache/spark:4.0.1
+    container_name: wm-spark
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      HOME: /opt/spark
+      # Toggle where to start reading (earliest for first boot, switch to latest later)
+      STARTING_OFFSETS: "earliest"    # earliest | latest
+      # Show a console probe of raw Kafka JSON (true/false)
+      PROBE_CONSOLE: "true"
     ports:
-      - "7077:7077"
-      - "8080:8080"
+      - "4040:4040"   # Spark UI
+    volumes:
+      - ./jobs:/opt/jobs
+      - ./checkpoints:/opt/checkpoints
+      - ./ivy:/opt/ivy
+    command:
+      [
+        "/opt/spark/bin/spark-submit",
+        "--master", "local[2]",
+        "--conf", "spark.sql.shuffle.partitions=4",
+        "--conf", "spark.streaming.stopGracefullyOnShutdown=true",
+        "--conf", "spark.jars.ivy=/opt/ivy",
+        "--packages", "org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1,org.postgresql:postgresql:42.7.3",
+        "/opt/jobs/spark_stream_wm.py",
+        "--kafka-bootstrap", "wm-kafka:9092",
+        "--topic", "wm-recentchange",
+        "--pg-url", "jdbc:postgresql://wm-postgres:5432/demai",
+        "--pg-user", "postgres",
+        "--pg-pass", "postgres",
+        "--checkpoint", "/opt/checkpoints/wm",
+        "--starting-offsets", "${STARTING_OFFSETS}",
+        "--probe-console", "${PROBE_CONSOLE}"
+      ]
+    restart: unless-stopped
 
-  # --- Spark Worker ---
-  spark-worker:
-    image: bitnami/spark:latest
-    container_name: spark-worker
+  fetch-stocks:
+    image: python:3.12-slim
+    container_name: wm-fetch-stocks
     depends_on:
-      - spark-master
+      postgres:
+        condition: service_healthy
     environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
+      PG_HOST: wm-postgres
+      PG_DB: demai
+      PG_USER: postgres
+      PG_PASS: postgres
+    volumes:
+      - ./jobs:/opt/jobs
+    command: ["python", "/opt/jobs/fetch_stocks.py"]
+    restart: unless-stopped
+
+
+  streamlit:
+    build:
+      context: ./streamlit
+    container_name: wm-streamlit
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: wm-postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: demai
     ports:
-      - "8081:8081"
-
-  # --- Event Simulator ---
-  event-simulator:
-    build: ./event-simulator
-    container_name: event-simulator
-    depends_on:
-      - kafka
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_TOPIC=wikipedia.changes
-
-  # --- Stream Processor ---
-  stream-processor:
-    build: ./stream-processor
-    container_name: stream-processor
-    depends_on:
-      - kafka
-      - mongo
-      - spark-master
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_TOPIC=wikipedia.changes
-      - MONGO_URI=mongodb://mongo:27017/
-      - MONGO_DB=wikipedia
-      - MONGO_COLLECTION=page_scores
+      - "8501:8501"
+    restart: unless-stopped
 
 volumes:
-  mongo-data:
-
-networks:
-  default:
-    name: sparknet
+  pg-data:
+  kafka-data:
