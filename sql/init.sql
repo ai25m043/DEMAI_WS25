@@ -230,3 +230,111 @@ SET name         = EXCLUDED.name,
     mic          = EXCLUDED.mic,
     tz           = EXCLUDED.tz,
     last_updated = now();
+
+-- ============================================================
+-- 5) Country dim + Ticker → Country mapping
+-- ============================================================
+CREATE TABLE IF NOT EXISTS country_dim (
+  iso2 CHAR(2) PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
+INSERT INTO country_dim(iso2, name) VALUES
+  ('US','United States'), ('CA','Canada'), ('GB','United Kingdom'), ('FR','France'),
+  ('DE','Germany'), ('IT','Italy'), ('ES','Spain'), ('NL','Netherlands'),
+  ('BE','Belgium'), ('IE','Ireland'), ('PT','Portugal'), ('SE','Sweden'),
+  ('NO','Norway'), ('CH','Switzerland'), ('AT','Austria'), ('PL','Poland'),
+  ('GR','Greece'), ('TR','Türkiye'), ('RU','Russia'), ('CN','China'),
+  ('JP','Japan'), ('KR','South Korea'), ('IN','India'), ('AU','Australia'),
+  ('BR','Brazil'), ('AR','Argentina'), ('MX','Mexico'), ('ZA','South Africa'),
+  ('EG','Egypt'), ('SA','Saudi Arabia'), ('AE','United Arab Emirates'),
+  ('SG','Singapore'), ('HK','Hong Kong'), ('TW','Taiwan')
+ON CONFLICT (iso2) DO NOTHING;
+
+ALTER TABLE ticker
+  ADD COLUMN IF NOT EXISTS iso2 CHAR(2),
+  ADD CONSTRAINT fk_ticker_country
+    FOREIGN KEY (iso2) REFERENCES country_dim(iso2);
+
+CREATE INDEX IF NOT EXISTS idx_ticker_iso2 ON ticker(iso2);
+
+-- Map seeded tickers → countries
+UPDATE ticker SET iso2='US' WHERE symbol IN ('AAPL','MSFT','AMZN','TSLA','META','NVDA','BABA');
+UPDATE ticker SET iso2='CA' WHERE symbol IN ('SHOP.TO');
+UPDATE ticker SET iso2='GB' WHERE symbol IN ('HSBA.L','BP.L');
+UPDATE ticker SET iso2='DE' WHERE symbol IN ('SAP.DE','VOW3.DE');
+UPDATE ticker SET iso2='FR' WHERE symbol IN ('MC.PA','AIR.PA');
+UPDATE ticker SET iso2='CH' WHERE symbol IN ('NOVN.SW','UBSG.SW');
+UPDATE ticker SET iso2='NL' WHERE symbol IN ('ASML.AS');
+UPDATE ticker SET iso2='SE' WHERE symbol IN ('VOLV-B.ST');
+UPDATE ticker SET iso2='JP' WHERE symbol IN ('7203.T','6758.T');
+UPDATE ticker SET iso2='KR' WHERE symbol IN ('005930.KS');
+UPDATE ticker SET iso2='HK' WHERE symbol IN ('0700.HK');
+UPDATE ticker SET iso2='IN' WHERE symbol IN ('TCS.NS','INFY.NS');
+UPDATE ticker SET iso2='AU' WHERE symbol IN ('BHP.AX','CBA.AX');
+UPDATE ticker SET iso2='BR' WHERE symbol IN ('PETR4.SA','VALE3.SA');
+UPDATE ticker SET iso2='ZA' WHERE symbol IN ('NPN.JO');
+UPDATE ticker SET iso2='SG' WHERE symbol IN ('D05.SI');
+
+-- ============================================================
+-- 6) Minute aggregates per country (views)
+-- ============================================================
+
+-- Wikimedia events per minute per country (UTC minute)
+CREATE OR REPLACE VIEW v_wm_country_minute AS
+SELECT
+  date_trunc('minute', dt AT TIME ZONE 'UTC') AS ts_minute_utc,
+  page_country_code::char(2)                 AS iso2,
+  COUNT(*)::int                              AS event_count
+FROM v_wm_recent_change_enabled
+GROUP BY 1,2;
+
+CREATE INDEX IF NOT EXISTS idx_wm_rc_country_dt ON wm_recent_change(page_country_code, dt);
+
+-- Symbol 1m returns (per ticker), then average by country/minute
+CREATE OR REPLACE VIEW v_symbol_return_1m AS
+SELECT
+  t.id            AS ticker_id,
+  t.symbol,
+  t.iso2::char(2) AS iso2,
+  sv.ts_utc       AS ts_minute_utc,
+  sv.close,
+  LAG(sv.close) OVER (PARTITION BY t.id ORDER BY sv.ts_utc) AS prev_close
+FROM stock_value_1m sv
+JOIN ticker t ON t.id = sv.ticker_id
+WHERE sv.interval = '1m';
+
+CREATE OR REPLACE VIEW v_country_return_minute AS
+SELECT
+  iso2,
+  ts_minute_utc,
+  AVG( (close - prev_close) / NULLIF(prev_close,0) ) AS avg_return_1m,
+  COUNT(*)::int                                      AS symbols_count
+FROM v_symbol_return_1m
+WHERE iso2 IS NOT NULL AND prev_close IS NOT NULL
+GROUP BY iso2, ts_minute_utc;
+
+-- Join both signals + rolling windows for the map
+CREATE OR REPLACE VIEW v_country_map_roll AS
+WITH recent AS (
+  SELECT
+    COALESCE(r.iso2, w.iso2)                     AS iso2,
+    COALESCE(r.ts_minute_utc, w.ts_minute_utc)   AS ts_minute_utc,
+    COALESCE(w.event_count, 0)                   AS event_count,
+    r.avg_return_1m,
+    r.symbols_count
+  FROM v_country_return_minute r
+  FULL OUTER JOIN v_wm_country_minute w
+    ON r.iso2 = w.iso2 AND r.ts_minute_utc = w.ts_minute_utc
+  WHERE COALESCE(r.ts_minute_utc, w.ts_minute_utc) >= now() AT TIME ZONE 'UTC' - interval '60 minutes'
+)
+SELECT
+  iso2,
+  MAX(ts_minute_utc) AS ts_latest_utc,
+  SUM(event_count) FILTER (WHERE ts_minute_utc >= now() AT TIME ZONE 'UTC' - interval '10 minutes') AS events_10m,
+  SUM(event_count) FILTER (WHERE ts_minute_utc >= now() AT TIME ZONE 'UTC' - interval '30 minutes') AS events_30m,
+  AVG(avg_return_1m) FILTER (WHERE ts_minute_utc >= now() AT TIME ZONE 'UTC' - interval '10 minutes') AS ret_avg_10m,
+  AVG(avg_return_1m) FILTER (WHERE ts_minute_utc >= now() AT TIME ZONE 'UTC' - interval '30 minutes') AS ret_avg_30m,
+  MAX(symbols_count) AS symbols_seen
+FROM recent
+GROUP BY iso2;

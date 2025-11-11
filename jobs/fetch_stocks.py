@@ -4,369 +4,379 @@
 """
 fetch_stocks.py
 ---------------
-Fetch recent OHLCV for tickers stored in PostgreSQL using PySpark + yfinance
-and upsert them into stock_value_1m.
+Minute OHLCV fetcher for symbols stored in 'ticker' and upserts into 'stock_value_1m'.
 
-Key fixes vs previous version:
-- Create 'ts' deterministically from index BEFORE lowercasing (handles 'Datetime'/'Date').
-- Flatten potential MultiIndex columns from yfinance (('Open', ''), etc).
-- Strong per-symbol logging with sample rows.
-- Safe conversions + smaller batch flush for visibility.
+Design:
+- Load all symbols from DB.
+- Determine last stored ts_utc per (ticker_id, interval).
+- For each symbol, fetch from last_ts (exclusive) or backfill window if empty.
+- Normalize to UTC, ensure numeric types, and upsert in batches.
+- Retry transient Yahoo/network errors a few times before skipping a symbol.
+
+Environment (with defaults):
+  PG_HOST=wm-postgres
+  PG_PORT=5432
+  PG_DB=demai
+  PG_USER=postgres
+  PG_PASS=postgres
+
+  YF_INTERVAL=1m
+  YF_BACKFILL_MIN=180          # minutes to backfill if symbol has no data yet
+  YF_THREADS=1                 # yfinance internal threads; per-symbol loop anyway
+  YF_PREPOST=false             # include pre/post market data
+  YF_MAX_TRIES=3               # retry attempts per symbol
+  YF_BATCH_UPSERT=2000         # rows per execute_values batch
 """
 
 import os
-from typing import Iterable, List, Tuple
-
-# --- yfinance runtime toggles (must be set before import yfinance happens in workers) ---
-os.environ.setdefault("YF_USE_CURL", "0")      # avoid curl_cffi cookie DB contention
-os.environ.setdefault("YF_MAX_WORKERS", "1")   # also pass threads=False to yf
+import sys
+import time
+import math
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
-from pyspark.sql import SparkSession, functions as F
+import psycopg2
+import psycopg2.extras as pgx
+import yfinance as yf
 
-# -----------------------------
-# Environment
-# -----------------------------
-APP_NAME = os.getenv("APP_NAME", "stocks-fetcher")
+# --------------------------
+# Logging
+# --------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("fetch_stocks")
 
+# --------------------------
+# Config
+# --------------------------
 PG_HOST = os.getenv("PG_HOST", "wm-postgres")
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
 PG_DB   = os.getenv("PG_DB", "demai")
 PG_USER = os.getenv("PG_USER", "postgres")
 PG_PASS = os.getenv("PG_PASS", "postgres")
-JDBC_URL = f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}?stringtype=unspecified"
 
-T_TICKER = os.getenv("T_TICKER", "ticker")
-T_VALUES = os.getenv("T_VALUES", "stock_value_1m")
+YF_INTERVAL       = os.getenv("YF_INTERVAL", "1m")
+YF_BACKFILL_MIN   = int(os.getenv("YF_BACKFILL_MIN", "180"))
+YF_THREADS        = int(os.getenv("YF_THREADS", "1"))
+YF_PREPOST        = os.getenv("YF_PREPOST", "false").lower() in ("1","true","yes")
+YF_MAX_TRIES      = int(os.getenv("YF_MAX_TRIES", "3"))
+YF_BATCH_UPSERT   = int(os.getenv("YF_BATCH_UPSERT", "2000"))
 
-# Spark partitions for the symbol list (tune if needed)
-SYMBOL_PARTITIONS = int(os.getenv("SYMBOL_PARTITIONS", "8"))
+# keep yfinance calm in containers
+os.environ.setdefault("YF_USE_CURL", "0")
+os.environ.setdefault("YF_MAX_WORKERS", str(max(1, YF_THREADS)))
 
-# Intervals to try (ladder). You can narrow to e.g. "1d,1h,15m" to debug faster.
-TARGET_INTERVALS = [i.strip() for i in os.getenv("YF_INTERVALS", "1m,2m,5m,15m,1h,1d").split(",") if i.strip()]
+SOURCE_TAG = "yfinance"
 
-# Map interval -> valid Yahoo "period"
-PERIOD_BY_INTERVAL = {
-    "1m":  "5d",
-    "2m":  "5d",
-    "5m":  "1mo",
-    "15m": "1mo",
-    "30m": "1mo",
-    "1h":  "3mo",
-    "1d":  "1y",
-}
+# --------------------------
+# DB helpers
+# --------------------------
+def connect_pg():
+    dsn = f"host={PG_HOST} port={PG_PORT} dbname={PG_DB} user={PG_USER} password={PG_PASS}"
+    return psycopg2.connect(dsn)
 
-# Some suffixes dislike ultra-fine intervals (ladder overrides)
-FALLBACK_BY_SUFFIX = {
-    ".DE":  ["2m","5m","15m","1h","1d"],
-    ".PA":  ["2m","5m","15m","1h","1d"],
-    ".AS":  ["2m","5m","15m","1h","1d"],
-    ".L":   ["2m","5m","15m","1h","1d"],
-    ".SW":  ["2m","5m","15m","1h","1d"],
-    ".ST":  ["2m","5m","15m","1h","1d"],
-    ".HK":  ["5m","15m","1h","1d"],
-    ".KS":  ["5m","15m","1h","1d"],
-    ".AX":  ["5m","15m","1h","1d"],
-    ".SI":  ["5m","15m","1h","1d"],
-    ".JO":  ["5m","15m","1h","1d"],
-    ".SA":  ["5m","15m","1h","1d"],
-    ".TO":  ["2m","5m","15m","1h","1d"],
-    ".NS":  ["2m","5m","15m","1h","1d"],
-}
+def fetch_tickers(conn) -> List[Tuple[int, str]]:
+    """
+    Returns list of (ticker_id, symbol).
+    Only symbols that look presentable for Yahoo.
+    """
+    sql = """
+        SELECT id, symbol
+        FROM ticker
+        WHERE symbol IS NOT NULL AND length(symbol) > 0
+        ORDER BY id
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    return [(int(r[0]), str(r[1])) for r in rows]
 
-# Debug helper: run only one symbol (set DRY_RUN_ONE=SYMBOL in env)
-DRY_RUN_ONE = os.getenv("DRY_RUN_ONE", "").strip() or None
+def fetch_last_ts_map(conn, interval: str) -> Dict[int, Optional[datetime]]:
+    """
+    Returns {ticker_id: last_ts_utc_or_None} for given interval.
+    """
+    sql = """
+        SELECT ticker_id, MAX(ts_utc) AS last_ts
+        FROM stock_value_1m
+        WHERE interval = %s
+        GROUP BY ticker_id
+    """
+    out: Dict[int, Optional[datetime]] = {}
+    with conn.cursor() as cur:
+        cur.execute(sql, (interval,))
+        for tid, last_ts in cur.fetchall():
+            out[int(tid)] = last_ts  # tz-aware from timestamptz
+    return out
 
+def upsert_ohlcv_rows(conn, rows: List[Tuple]):
+    """
+    rows: list of tuples matching the INSERT column order below.
+    """
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO stock_value_1m
+            (ticker_id, ts_utc, interval, open, high, low, close, volume, prepost, source, is_final)
+        VALUES %s
+        ON CONFLICT (ticker_id, ts_utc, interval)
+        DO UPDATE SET
+            open   = EXCLUDED.open,
+            high   = EXCLUDED.high,
+            low    = EXCLUDED.low,
+            close  = EXCLUDED.close,
+            volume = EXCLUDED.volume,
+            prepost= EXCLUDED.prepost,
+            source = EXCLUDED.source,
+            ingested_at = now(),
+            is_final = EXCLUDED.is_final
+    """
+    inserted = 0
+    with conn.cursor() as cur:
+        # chunk to avoid massive packets
+        for i in range(0, len(rows), YF_BATCH_UPSERT):
+            chunk = rows[i:i+YF_BATCH_UPSERT]
+            pgx.execute_values(cur, sql, chunk, template=None, page_size=len(chunk))
+            inserted += len(chunk)
+    conn.commit()
+    return inserted
 
-def choose_intervals(symbol: str) -> List[str]:
-    for suf, ladder in FALLBACK_BY_SUFFIX.items():
-        if symbol.endswith(suf):
-            return [i for i in TARGET_INTERVALS if i in ladder]
-    return TARGET_INTERVALS
-
-
-def period_for_interval(interval: str) -> str:
-    return PERIOD_BY_INTERVAL.get(interval, "1mo")
-
-
-# -----------------------------
-# Spark session
-# -----------------------------
-spark = (
-    SparkSession.builder
-        .appName(APP_NAME)
-        .config("spark.sql.session.timeZone", "UTC")
-        .getOrCreate()
-)
-spark.sparkContext.setLogLevel("WARN")
-
-
-# -----------------------------
-# Load tickers (id, symbol)
-# -----------------------------
-tickers_df = (
-    spark.read
-         .format("jdbc")
-         .option("url", JDBC_URL)
-         .option("dbtable", T_TICKER)
-         .option("user", PG_USER)
-         .option("password", PG_PASS)
-         .option("driver", "org.postgresql.Driver")
-         .load()
-         .select(F.col("id").cast("int").alias("ticker_id"),
-                 F.col("symbol").cast("string").alias("symbol"))
-)
-
-if DRY_RUN_ONE:
-    tickers_df = tickers_df.where(F.col("symbol") == F.lit(DRY_RUN_ONE))
-
-tickers_df = tickers_df.orderBy("symbol")
-count_tickers = tickers_df.count()
-print(f"[stocks] ticker count = {count_tickers}")
-tickers_df.show(10, truncate=False)
-
-if count_tickers == 0:
-    print("[stocks] no tickers found. Check table 'ticker'.")
-    spark.stop()
-    raise SystemExit(0)
-
-tickers_df = tickers_df.repartition(min(SYMBOL_PARTITIONS, max(1, count_tickers)))
-
-
-# -----------------------------
-# Partition writer
-# -----------------------------
-def fetch_and_upsert_partition(rows: Iterable[Tuple[int, str]]):
-    import os
-    import time
-    from datetime import timezone
-
-    import psycopg2
-    from psycopg2.extras import execute_values
-    import yfinance as yf
-    import numpy as np
-    import pandas as pd
-
-    os.environ["YF_USE_CURL"] = "0"   # double-enforce in worker
-
-    pid = os.getpid()
-    print(f"[stocks][pid={pid}] partition START")
-
-    # DB setup
-    conn = None
-    upserted_total = 0
-
-    def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-        """Flatten possible MultiIndex columns from yfinance."""
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = ["_".join([str(x) for x in tup if str(x)]).strip() for tup in df.columns]
-        else:
-            df.columns = [str(c) for c in df.columns]
-        return df
-
-    def normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        1) Ensure index is UTC datetime, name it 'ts'.
-        2) reset_index() so we have a proper 'ts' column.
-        3) Lower-case and sanitize column names.
-        4) Keep only ts/open/high/low/close/volume.
-        """
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return pd.DataFrame()
-
-        df = df.copy()
-        df = flatten_columns(df)
-
-        # Make sure index -> UTC datetime and becomes 'ts'
+# --------------------------
+# yfinance helpers
+# --------------------------
+def safe_history(symbol: str, start_dt_utc: datetime, interval: str, prepost: bool, tries: int) -> pd.DataFrame:
+    """
+    Fetch history for a single symbol with retries.
+    Returns a DataFrame with index as DatetimeIndex (tz-aware if Yahoo provides).
+    """
+    # yfinance sometimes ignores 'start' depending on interval; still best effort
+    delay = 1.0
+    for attempt in range(1, tries+1):
         try:
-            df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
-        except Exception:
-            pass
-        df.index.name = "ts"
-
-        # Pandas >=1.4 supports names="ts"; the generic path also works
-        try:
-            df = df.reset_index(names="ts")
-        except TypeError:
-            df = df.reset_index()
-
-        # normalize columns AFTER reset_index so 'ts' is deterministic
-        df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-
-        # standardize possible yfinance variants (e.g., 'adj_close', 'close')
-        rename_map = {
-            "adj_close": "adj_close",
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "volume": "volume",
-        }
-        # keep what's present
-        keep = [c for c in ["ts", "open", "high", "low", "close", "volume", "adj_close"] if c in df.columns]
-        df = df[keep].copy()
-
-        # Prefer 'close' over 'adj_close' for storage; if only adj_close exists, map it to close.
-        if "close" not in df.columns and "adj_close" in df.columns:
-            df["close"] = df["adj_close"]
-        if "adj_close" in df.columns:
-            df = df.drop(columns=["adj_close"])
-
-        # Types & NaNs
-        for c in ["open", "high", "low", "close"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        if "volume" in df.columns:
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype("Int64")
-
-        # Drop rows without ts
-        if "ts" in df.columns:
-            df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-            df = df[df["ts"].notna()]
-        else:
-            # Shouldn't happen, but keep contract
-            return pd.DataFrame()
-
+            # Use Ticker.history for clean per-symbol fetch
+            tk = yf.Ticker(symbol)
+            df = tk.history(
+                start=start_dt_utc,  # UTC-aware dt ok
+                interval=interval,
+                actions=False,
+                prepost=prepost,
+                auto_adjust=False,
+                repair=True,
+                raise_errors=True,
+            )
+            return df
+        except Exception as e:
+            log.warning("[%s] history() attempt %d/%d failed: %s", symbol, attempt, tries, e)
+            if attempt < tries:
+                time.sleep(delay)
+                delay = min(delay * 2.0, 8.0)
+    # fallback to download() (rarely helps but try once)
+    try:
+        log.info("[%s] fallback to yf.download()", symbol)
+        df = yf.download(
+            tickers=symbol,
+            start=start_dt_utc,
+            interval=interval,
+            group_by="column",   # single symbol -> flat columns
+            prepost=prepost,
+            auto_adjust=False,
+            progress=False,
+            repair=True,
+        )
         return df
+    except Exception as e:
+        log.error("[%s] yf.download fallback failed: %s", symbol, e)
+        return pd.DataFrame()
+
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep only OHLCV columns, ensure tz-aware UTC index, coerce numerics.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # Flatten potential weirdness
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ["_".join([c for c in tup if c]) for tup in df.columns]
+    # Try to select OHLCV columns under typical names
+    candidates = {
+        "Open":  "open",
+        "High":  "high",
+        "Low":   "low",
+        "Close": "close",
+        "Volume":"volume",
+    }
+    # handle lowercase variations
+    lower_map = {c.lower(): c for c in df.columns}
+    data = {}
+    for yf_name, std in candidates.items():
+        c = None
+        if yf_name in df.columns:
+            c = yf_name
+        elif yf_name.lower() in lower_map:
+            c = lower_map[yf_name.lower()]
+        if c is not None:
+            data[std] = pd.to_numeric(df[c], errors="coerce")
+        else:
+            data[std] = pd.Series([None] * len(df), index=df.index)
+
+    out = pd.DataFrame(data, index=df.index)
+
+    # Ensure index is tz-aware, convert to UTC
+    idx = out.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        # yfinance should always return DatetimeIndex; guard anyway
+        out = out.reset_index().rename(columns={"index": "ts"})
+        out["ts"] = pd.to_datetime(out["ts"], utc=True, errors="coerce")
+        out = out.set_index("ts")
+    else:
+        if idx.tz is None:
+            out.index = idx.tz_localize(timezone.utc)
+        else:
+            out.index = idx.tz_convert(timezone.utc)
+
+    # Drop rows where all OHLC are NaN
+    out = out.dropna(subset=["open","high","low","close"], how="all")
+    # Keep at minute precision
+    out.index = out.index.map(lambda x: x.replace(second=0, microsecond=0))
+    out = out[~out.index.duplicated(keep="last")]
+    return out.sort_index()
+
+# --------------------------
+# Main worker
+# --------------------------
+def main():
+    log.info("Connecting to PostgreSQL at %s:%s (db=%s, user=%s)", PG_HOST, PG_PORT, PG_DB, PG_USER)
+    try:
+        conn = connect_pg()
+    except Exception as e:
+        log.error("Failed to connect to PostgreSQL: %s", e)
+        sys.exit(2)
 
     try:
-        conn = psycopg2.connect(host=PG_HOST, dbname=PG_DB, user=PG_USER, password=PG_PASS)
-        cur = conn.cursor()
-        batch = []
-        FLUSH_EVERY = 500  # small for debugging visibility
-
-        for ticker_id, symbol in rows:
-            last_err = None
-            got_rows = 0
-            chosen = choose_intervals(symbol)
-
-            for interval in chosen:
-                try:
-                    df = yf.download(
-                        tickers=symbol,
-                        period=period_for_interval(interval),
-                        interval=interval,
-                        auto_adjust=False,
-                        prepost=True,
-                        threads=False,   # important when YF_MAX_WORKERS=1
-                        progress=False,
-                        timeout=20,
-                    )
-
-                    df = normalize_frame(df)
-                    if df.empty or "ts" not in df.columns:
-                        # For debugging: show what we got originally (shape & columns)
-                        if isinstance(df, pd.DataFrame):
-                            print(f"[stocks][pid={pid}] {symbol}: got data but no usable rows after normalize; shape={df.shape}")
-                        continue
-
-                    # Log a tiny preview
-                    cols = [c for c in ["ts","open","high","low","close","volume"] if c in df.columns]
-                    print(f"[stocks][pid={pid}] {symbol}: interval={interval} cols={cols} sample:")
-                    print(df[cols].head(3).to_string(index=False))
-
-                    added = 0
-                    for _, r in df.iterrows():
-                        ts = r["ts"]
-                        if pd.isna(ts):
-                            continue
-                        o = None if "open" not in r or pd.isna(r["open"]) else float(r["open"])
-                        h = None if "high" not in r or pd.isna(r["high"]) else float(r["high"])
-                        l = None if "low"  not in r or pd.isna(r["low"])  else float(r["low"])
-                        c = None if "close" not in r or pd.isna(r["close"]) else float(r["close"])
-                        v = None
-                        if "volume" in r and pd.notna(r["volume"]):
-                            try:
-                                v = int(r["volume"])
-                            except Exception:
-                                v = None
-
-                        batch.append((
-                            int(ticker_id),
-                            ts.to_pydatetime().replace(tzinfo=timezone.utc),
-                            o, h, l, c, v, False, "yfinance"
-                        ))
-                        added += 1
-
-                    if added > 0:
-                        got_rows += added
-                        print(f"[stocks][pid={pid}] {symbol}: interval={interval} rows={added}")
-                        break  # stop ladder once an interval succeeded
-
-                except Exception as e:
-                    last_err = e
-                    print(f"[stocks][pid={pid}] {symbol}: interval={interval} ERROR -> {repr(e)}")
-                    time.sleep(0.2)
-                    continue
-
-            if got_rows == 0:
-                if last_err is not None:
-                    print(f"[stocks][pid={pid}] {symbol}: NO DATA from {chosen}. last_err={repr(last_err)}")
-                else:
-                    print(f"[stocks][pid={pid}] {symbol}: NO DATA (no error) from {chosen}")
-
-            # flush intermittently
-            if len(batch) >= FLUSH_EVERY:
-                try:
-                    execute_values(cur, f"""
-                        INSERT INTO {T_VALUES}
-                          (ticker_id, ts_utc, open, high, low, close, volume, prepost, source)
-                        VALUES %s
-                        ON CONFLICT (ticker_id, ts_utc) DO UPDATE
-                        SET open=EXCLUDED.open,
-                            high=EXCLUDED.high,
-                            low=EXCLUDED.low,
-                            close=EXCLUDED.close,
-                            volume=EXCLUDED.volume,
-                            prepost=EXCLUDED.prepost,
-                            source=EXCLUDED.source
-                    """, batch)
-                    conn.commit()
-                    upserted_total += len(batch)
-                    print(f"[stocks][pid={pid}] UPSERT flush: {len(batch)} rows (total {upserted_total})")
-                except Exception as sql_err:
-                    print(f"[stocks][pid={pid}] UPSERT ERROR: {sql_err}")
-                finally:
-                    batch.clear()
-
-        # final flush
-        if batch:
-            try:
-                execute_values(cur, f"""
-                    INSERT INTO {T_VALUES}
-                      (ticker_id, ts_utc, open, high, low, close, volume, prepost, source)
-                    VALUES %s
-                    ON CONFLICT (ticker_id, ts_utc) DO UPDATE
-                    SET open=EXCLUDED.open,
-                        high=EXCLUDED.high,
-                        low=EXCLUDED.low,
-                        close=EXCLUDED.close,
-                        volume=EXCLUDED.volume,
-                        prepost=EXCLUDED.prepost,
-                        source=EXCLUDED.source
-                """, batch)
-                conn.commit()
-                upserted_total += len(batch)
-                print(f"[stocks][pid={pid}] UPSERT final: {len(batch)} rows (total {upserted_total})")
-            except Exception as sql_err:
-                print(f"[stocks][pid={pid}] UPSERT ERROR (final): {sql_err}")
-            finally:
-                batch.clear()
-
+        tickers = fetch_tickers(conn)
     except Exception as e:
-        print(f"[stocks][pid={pid}] partition error: {e}")
-    finally:
-        if conn:
+        log.error("Failed to read tickers: %s", e)
+        conn.close()
+        sys.exit(2)
+
+    if not tickers:
+        log.warning("No tickers found. Seed the 'ticker' table first.")
+        conn.close()
+        return
+
+    log.info("Loaded %d tickers.", len(tickers))
+
+    try:
+        last_ts_map = fetch_last_ts_map(conn, YF_INTERVAL)
+    except Exception as e:
+        log.error("Failed to load last timestamps: %s", e)
+        last_ts_map = {}
+
+    now_utc = datetime.now(timezone.utc)
+
+    total_rows = 0
+    symbols_ok = 0
+    symbols_err = 0
+
+    for ticker_id, symbol in tickers:
+        last_ts = last_ts_map.get(ticker_id)
+        if last_ts is None:
+            start_utc = now_utc - timedelta(minutes=YF_BACKFILL_MIN)
+            log.info("[%s] backfill from %s → now (interval=%s, prepost=%s)",
+                     symbol, start_utc.isoformat(), YF_INTERVAL, YF_PREPOST)
+        else:
+            # advance by one minute to avoid re-inserting the last bar
+            start_utc = (last_ts + timedelta(minutes=1)).astimezone(timezone.utc)
+            log.info("[%s] incremental from %s → now (interval=%s, prepost=%s)",
+                     symbol, start_utc.isoformat(), YF_INTERVAL, YF_PREPOST)
+
+        # Fetch with retries
+        try:
+            raw = safe_history(symbol, start_utc, YF_INTERVAL, YF_PREPOST, YF_MAX_TRIES)
+        except Exception as e:
+            log.error("[%s] unhandled exception during fetch: %s", symbol, e)
+            symbols_err += 1
+            continue
+
+        if raw is None or raw.empty:
+            log.info("[%s] no new rows returned.", symbol)
+            symbols_ok += 1
+            continue
+
+        # Normalize
+        try:
+            df = normalize_df(raw)
+        except Exception as e:
+            log.error("[%s] normalize failed: %s", symbol, e)
+            symbols_err += 1
+            continue
+
+        if df.empty:
+            log.info("[%s] nothing to insert after normalization.", symbol)
+            symbols_ok += 1
+            continue
+
+        # Build row tuples for upsert
+        # (ticker_id, ts_utc, interval, open, high, low, close, volume, prepost, source, is_final)
+        rows = []
+        for ts, rec in df.iterrows():
             try:
-                conn.close()
-            except Exception:
-                pass
-        print(f"[stocks][pid={pid}] partition END, total upserted={upserted_total}")
+                rows.append((
+                    ticker_id,
+                    ts,                     # tz-aware UTC
+                    YF_INTERVAL,
+                    None if pd.isna(rec["open"])  else float(rec["open"]),
+                    None if pd.isna(rec["high"])  else float(rec["high"]),
+                    None if pd.isna(rec["low"])   else float(rec["low"]),
+                    None if pd.isna(rec["close"]) else float(rec["close"]),
+                    None if pd.isna(rec["volume"]) else int(rec["volume"]),
+                    bool(YF_PREPOST),
+                    SOURCE_TAG,
+                    True,  # is_final
+                ))
+            except Exception as e:
+                log.warning("[%s] row build skipped for %s: %s", symbol, ts, e)
+
+        if not rows:
+            log.info("[%s] no valid rows after build; skipping upsert.", symbol)
+            symbols_ok += 1
+            continue
+
+        # Upsert
+        try:
+            inserted = upsert_ohlcv_rows(conn, rows)
+            total_rows += inserted
+            symbols_ok += 1
+            log.info("[%s] upserted %d rows. Sample: first=%s last=%s",
+                     symbol, inserted, rows[0][1].isoformat(), rows[-1][1].isoformat())
+        except Exception as e:
+            conn.rollback()
+            symbols_err += 1
+            log.error("[%s] upsert failed (rolled back): %s", symbol, e)
+
+        # small politeness delay if you want to avoid hammering
+        if YF_THREADS <= 1:
+            time.sleep(0.2)
+
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+    log.info("Done. Symbols OK=%d, Errors=%d, Rows upserted=%d",
+             symbols_ok, symbols_err, total_rows)
 
 
-# Kick off
-pairs = tickers_df.select("ticker_id", "symbol").rdd.map(lambda r: (r["ticker_id"], r["symbol"]))
-pairs.foreachPartition(fetch_and_upsert_partition)
-
-print("[stocks] driver DONE")
-spark.stop()
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user.")
+        sys.exit(1)
+    except Exception as e:
+        log.exception("Fatal error: %s", e)
+        sys.exit(2)
