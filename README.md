@@ -1,6 +1,6 @@
 # Wikimedia–Stock Market Correlation Platform
 
-**Team:** Christopher Christopher, Benedikt Fritzenwallner, Mine Sungur
+**Team:** Christopher Chellakudam, Benedikt Fritzenwallner, Mine Sungur 
 **Course:** Data Engineering  
 **Date:** November 2025  
 
@@ -32,12 +32,11 @@ The result is a robust, reproducible, and observable streaming architecture that
 ## System Architecture and Design
 
 ### High-Level Architecture
-
 ```mermaid
 flowchart LR
-  A[Wikimedia EventStreams (SSE)] --> B[Bridge: Enrich with Wikidata Country + QIDs]
-  B -->|JSON| K[(Kafka: wm-recentchange)]
-  K --> S[Spark Structured Streaming (topic tagging, persist)]
+  A["Wikimedia EventStreams (SSE)"] --> B["Bridge: Enrich with Wikidata Country + QIDs"]
+  B -->|JSON| K[("Kafka: wm-recentchange")]
+  K --> S["Spark Structured Streaming (topic tagging, persist)"]
   S --> P[(PostgreSQL)]
   subgraph Stocks
     F[yfinance fetcher] --> P
