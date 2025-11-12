@@ -1,4 +1,3 @@
-# bridge/bridge.py
 import os, sys, time, json, re, traceback
 import requests
 from sseclient import SSEClient

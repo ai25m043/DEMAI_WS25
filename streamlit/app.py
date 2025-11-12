@@ -1,4 +1,3 @@
-# streamlit/app.py
 # ================================================
 # Wikimedia Events (by Topic) + Stocks (by Ticker)
 # - Multi-select topics & time window
@@ -166,7 +165,7 @@ def centroids_by_iso2() -> dict[str, list[float]]:
     return out
 
 # -----------------------------
-# Queries (⚠️ Boolean types must be SA_Boolean())
+# Queries (Boolean types must be SA_Boolean())
 # -----------------------------
 Q_EVENTS = text("""
   SELECT
@@ -330,8 +329,8 @@ else:
 # -----------------------------
 st.subheader("Stocks (selected tickers)")
 if not prices.empty:
-    y_min = prices["low"].min() * 0.99  # 1 % tiefer
-    y_max = prices["high"].max() * 1.01  # 1 % höher
+    y_min = prices["low"].min() * 0.99  # 1% lower
+    y_max = prices["high"].max() * 1.01  # 1% higher
     # Price band (low↔high) + close line
     price_chart = alt.layer(
         alt.Chart(prices).mark_area(opacity=0.15).encode(
@@ -355,7 +354,7 @@ if not prices.empty:
 if not prices.empty:
     prices_sorted = prices.sort_values("ts_utc")
 
-    # Prozentuale Veränderung relativ zum ersten Close pro Symbol
+    # Percentage change relative to the first close per symbol
     first_close = prices_sorted.groupby("symbol")["close"].transform("first")
     prices_pct = prices_sorted.assign(
         p_low   = (prices_sorted["low"]   / first_close - 1) * 100,
