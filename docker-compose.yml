@@ -127,39 +127,50 @@ services:
 
 
   spark-stocks:
-    image: apache/spark:4.0.1
+    image: python:3.11-slim
     container_name: wm-spark-stocks
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      SPARK_NO_DAEMONIZE: "true"
-      HOME: /opt/spark
       PG_HOST: wm-postgres
       PG_PORT: "5432"
       PG_DB: demai
       PG_USER: postgres
       PG_PASS: postgres
-      # tune if you like:
-      SYMBOL_PARTITIONS: "8"
-      YF_INTERVALS: "1m,2m,5m,15m,1h,1d"
+      
+      # Which intervals to fetch (comma-separated)
+      YF_INTERVALS: "1m,5m,1h,1d"
+      
+      # How often to run fetch cycle (seconds)
+      FETCH_CYCLE_SECS: "60"
+      
+      # Python config
+      PYTHONUNBUFFERED: "1"
+      
     volumes:
-      - ./jobs:/opt/jobs
-      - ./ivy:/opt/ivy
-    # Install py deps then run spark-submit with JDBC
+      - ./jobs:/app
+    working_dir: /app
     command:
-      [
-        "bash","-lc",
-        "pip install --no-cache-dir pandas yfinance psycopg2-binary && \
-         /opt/spark/bin/spark-submit \
-           --master local[2] \
-           --conf spark.sql.session.timeZone=UTC \
-           --conf spark.jars.ivy=/opt/ivy \
-           --packages org.postgresql:postgresql:42.7.3 \
-           /opt/jobs/fetch_stocks.py"
-      ]
+      - bash
+      - -c
+      - |
+        echo "Stock Fetcher Starting..."
+        echo "Installing dependencies..."
+        
+        pip install --no-cache-dir -q \
+          numpy \
+          scipy \
+          pandas==2.2.2 \
+          yfinance==0.2.66 \
+          psycopg2-binary \
+          pytz
+        
+        echo "Dependencies installed"
+        echo "Starting fetch_stocks.py..."
+        python3 fetch_stocks.py
+        
     restart: unless-stopped
-
 
   streamlit:
     build:
