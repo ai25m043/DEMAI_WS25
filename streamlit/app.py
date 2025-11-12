@@ -330,22 +330,63 @@ else:
 # -----------------------------
 st.subheader("Stocks (selected tickers)")
 if not prices.empty:
+    y_min = prices["low"].min() * 0.99  # 1 % tiefer
+    y_max = prices["high"].max() * 1.01  # 1 % höher
     # Price band (low↔high) + close line
     price_chart = alt.layer(
         alt.Chart(prices).mark_area(opacity=0.15).encode(
             x=alt.X("ts_utc:T", title="Time (UTC)"),
-            y=alt.Y("low:Q", title="Price"),
+            y=alt.Y("low:Q", title="Price", scale=alt.Scale(domain=[y_min, y_max])),
             y2="high:Q",
             color=alt.Color("symbol:N", legend=alt.Legend(title="Symbol"))
         ),
         alt.Chart(prices).mark_line().encode(
             x="ts_utc:T",
-            y=alt.Y("close:Q", title="Close"),
+            y=alt.Y("close:Q", title="Close", scale=alt.Scale(domain=[y_min, y_max])),
             color="symbol:N"
         )
     ).properties(height=280).resolve_scale(y='independent')
 
     st.altair_chart(price_chart, use_container_width=True)
+
+# --------------------------------
+# Percentage change variant (Δ %)
+# --------------------------------
+if not prices.empty:
+    prices_sorted = prices.sort_values("ts_utc")
+
+    # Prozentuale Veränderung relativ zum ersten Close pro Symbol
+    first_close = prices_sorted.groupby("symbol")["close"].transform("first")
+    prices_pct = prices_sorted.assign(
+        p_low   = (prices_sorted["low"]   / first_close - 1) * 100,
+        p_high  = (prices_sorted["high"]  / first_close - 1) * 100,
+        p_close = (prices_sorted["close"] / first_close - 1) * 100,
+    )
+
+    y_min_p = float(prices_pct["p_low"].min()) * 1.05
+    y_max_p = float(prices_pct["p_high"].max()) * 1.05
+
+    ref_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4,4]).encode(y="y:Q")
+
+    pct_chart = alt.layer(
+        alt.Chart(prices_pct).mark_area(opacity=0.15).encode(
+            x=alt.X("ts_utc:T", title="Time (UTC)"),
+            y=alt.Y("p_low:Q", title="Change (%)", scale=alt.Scale(domain=[y_min_p, y_max_p])),
+            y2="p_high:Q",
+            color=alt.Color("symbol:N", legend=alt.Legend(title="Symbol"))
+        ),
+        alt.Chart(prices_pct).mark_line().encode(
+            x="ts_utc:T",
+            y=alt.Y("p_close:Q", title="Change (%)", scale=alt.Scale(domain=[y_min_p, y_max_p])),
+            color="symbol:N"
+        ),
+        ref_rule
+    ).properties(
+        height=260,
+        title="Normalized change since start (%)"
+    )
+
+    st.altair_chart(pct_chart, use_container_width=True)
 
     # Volume chart
     vol_chart = alt.Chart(prices).mark_bar(opacity=0.4).encode(
