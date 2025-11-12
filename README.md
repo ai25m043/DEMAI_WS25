@@ -1,6 +1,6 @@
 # Wikimedia–Stock Market Correlation Platform
 
-**Team:** Christopher Mathew, [add teammates]  
+**Team:** Christopher Christopher, Benedikt Fritzenwallner, Mine Sungur
 **Course:** Data Engineering  
 **Date:** November 2025  
 
