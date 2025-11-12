@@ -1,6 +1,6 @@
 # Wikimedia–Stock Market Correlation Platform
 
-**Team:** Christopher Chellakudam, Benedikt Fritzenwallner, Mine Sungur 
+**Team:** Christopher Chellakudam, Benedikt Fritzenwallner, Mine Sungur  
 **Course:** Data Engineering  
 **Date:** November 2025  
 
